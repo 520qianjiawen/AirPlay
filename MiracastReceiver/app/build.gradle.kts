@@ -3,6 +3,14 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// 要打包的 ABI：-PbuildArm64 / -PbuildArm32 只出单一架构，默认两种都出（含 universal）
+val targetAbis = when {
+    project.hasProperty("buildArm64") -> listOf("arm64-v8a")
+    project.hasProperty("buildArm32") -> listOf("armeabi-v7a")
+    else -> listOf("arm64-v8a", "armeabi-v7a")
+}
+val buildUniversalApk = targetAbis.size > 1
+
 android {
     namespace = "com.weekd.miracastreceiver"
     compileSdk = 36
@@ -11,13 +19,17 @@ android {
         applicationId = "com.weekd.miracastreceiver"
         minSdk = 21
         targetSdk = 36
-        versionCode = 9
-        versionName = "1.2.4"
+        versionCode = 10
+        versionName = "1.2.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        ndk {
-            abiFilters += setOf("armeabi-v7a", "arm64-v8a")
+        // universal 包需要 ndk.abiFilters 排除 x86/x86_64；
+        // 单 ABI 构建时 AGP 不允许它与 splits.abi 同时存在，所以只在出 universal 包时设置
+        if (buildUniversalApk) {
+            ndk {
+                abiFilters += targetAbis
+            }
         }
     }
 
@@ -42,13 +54,8 @@ android {
         abi {
             isEnable = true
             reset()
-            val abiFilter = when {
-                project.hasProperty("buildArm64") -> listOf("arm64-v8a")
-                project.hasProperty("buildArm32") -> listOf("armeabi-v7a")
-                else -> listOf("arm64-v8a", "armeabi-v7a")
-            }
-            include(*abiFilter.toTypedArray())
-            isUniversalApk = !project.hasProperty("buildArm64") && !project.hasProperty("buildArm32")
+            include(*targetAbis.toTypedArray())
+            isUniversalApk = buildUniversalApk
         }
     }
 
