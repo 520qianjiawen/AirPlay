@@ -15,6 +15,7 @@ class MdnsAdvertiser(private val context: Context) {
         const val AIRPLAY_SERVICE_TYPE = "_airplay._tcp."
         const val RAOP_SERVICE_TYPE = "_raop._tcp."
         const val MIRACAST_SERVICE_TYPE = "_miracast-receiver._tcp."
+        const val MIRACAST_NAME_SUFFIX = " MR"
         const val DEFAULT_PORT = 7000
     }
 
@@ -169,7 +170,10 @@ class MdnsAdvertiser(private val context: Context) {
 
         val serviceInfo = NsdServiceInfo().apply {
             serviceType = MIRACAST_SERVICE_TYPE
-            this.serviceName = serviceName
+            // 实例名不能与 _airplay._tcp 相同：未更新 Connectivity 模块的系统（如部分
+            // Android 14 电视）不允许同名不同类型的服务共存，会导致 AirPlay 注册失败（issue #16）。
+            // 真实设备名仍通过 TXT 记录的 "name" 字段提供给发送端。
+            this.serviceName = "$serviceName$MIRACAST_NAME_SUFFIX"
             this.port = port
 
             deviceInfo.forEach { (key, value) ->
