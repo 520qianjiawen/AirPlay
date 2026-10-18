@@ -533,21 +533,24 @@ class PlayerActivity : AppCompatActivity() {
             while (isActive) {
                 val videoW = StreamStats.videoWidth
                 val videoH = StreamStats.videoHeight
-                if (videoW > 0 && videoH > 0 && (videoW != lastW || videoH != lastH)) {
+                // 只有真正适配成功才记下尺寸：上一会话残留的尺寸会在布局完成前就读到，
+                // 此时父视图宽高为 0 无法适配，若提前记下就不再重试，画面会一直被拉伸铺满。
+                if (videoW > 0 && videoH > 0 && (videoW != lastW || videoH != lastH) &&
+                    fitMirrorSurface(videoW, videoH)) {
                     lastW = videoW
                     lastH = videoH
-                    fitMirrorSurface(videoW, videoH)
                 }
                 delay(300)
             }
         }
     }
 
-    private fun fitMirrorSurface(videoW: Int, videoH: Int) {
-        val parent = mirrorSurfaceView.parent as? View ?: return
+    /** 按视频比例缩放镜像 Surface；父视图尚未完成布局时返回 false，由调用方稍后重试。 */
+    private fun fitMirrorSurface(videoW: Int, videoH: Int): Boolean {
+        val parent = mirrorSurfaceView.parent as? View ?: return false
         val parentW = parent.width
         val parentH = parent.height
-        if (parentW <= 0 || parentH <= 0) return
+        if (parentW <= 0 || parentH <= 0) return false
 
         val videoAspect = videoW.toFloat() / videoH.toFloat()
         val parentAspect = parentW.toFloat() / parentH.toFloat()
@@ -562,6 +565,7 @@ class PlayerActivity : AppCompatActivity() {
             height = targetH.coerceAtLeast(1)
         }
         Timber.i("AirPlay mirror aspect-fit: video=${videoW}x$videoH view=${targetW}x$targetH parent=${parentW}x$parentH")
+        return true
     }
 
     /**

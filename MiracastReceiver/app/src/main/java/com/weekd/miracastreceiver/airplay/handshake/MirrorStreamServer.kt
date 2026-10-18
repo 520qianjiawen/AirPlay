@@ -11,6 +11,7 @@ import java.io.InputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
@@ -62,6 +63,12 @@ class MirrorStreamServer(
     // Set by the reader thread when a frame is dropped under load; the decoder thread then skips
     // frames until the next keyframe (IDR) so it never decodes a reference-broken, corrupt stream.
     @Volatile private var awaitingKeyframe = false
+    // Set while an AirPlay video-URL handoff owns the Surface (iOS plays a full-screen web/app video
+    // during a mirror and POSTs /play). A Surface takes only ONE producer at a time, so the decoder
+    // thread releases its MediaCodec (freeing the Surface for MediaPlayer) and drops frames until
+    // [resumeDecoding]; SPS/PPS updates that arrive meanwhile are still cached.
+    @Volatile private var suspended = false
+    @Volatile private var suspendLatch: CountDownLatch? = null
 
     /** The OS-assigned TCP port macOS should connect to (returned in the SETUP response). */
     val dataPort: Int get() = serverSocket.localPort
@@ -79,6 +86,29 @@ class MirrorStreamServer(
         queue.clear()
         Logger.i("MirrorStreamServer stopped")
     }
+
+    /**
+     * Releases the mirror decoder so the URL-video player can attach to the shared Surface. Blocks
+     * until the decoder thread has let go (or [SUSPEND_TIMEOUT_MS]); returns true if it did.
+     */
+    fun suspendDecoding(): Boolean {
+        if (!running) return true
+        val latch = CountDownLatch(1)
+        suspendLatch = latch
+        suspended = true
+        val released = latch.await(SUSPEND_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        Logger.i("Mirror decoding suspended for URL video (surface released=$released)")
+        return released
+    }
+
+    /** Ends [suspendDecoding]: the decoder is rebuilt from the cached SPS/PPS and resyncs at the next IDR. */
+    fun resumeDecoding() {
+        if (!suspended) return
+        suspended = false
+        Logger.i("Mirror decoding resumed after URL video")
+    }
+
+    val isSuspended: Boolean get() = suspended
 
     // ─── Network reader thread: read + decrypt (ordered), enqueue, never block on decode ──────
     private fun runReader() {
@@ -154,7 +184,13 @@ class MirrorStreamServer(
     private fun runDecoder() {
         try {
             while (running) {
+                if (suspended) releaseForSuspend()
                 val item = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                if (suspended) {
+                    // URL video owns the Surface: keep the latest config for the resume, drop frames.
+                    if (item is Config) { lastSps = item.sps; lastPps = item.pps }
+                    continue
+                }
                 when (item) {
                     is Config -> configureDecoder(item.sps, item.pps)
                     is Frame -> decodeFrame(item.annexB)
@@ -166,6 +202,13 @@ class MirrorStreamServer(
             decoder?.release()
             decoder = null
         }
+    }
+
+    /** Decoder thread: drop the MediaCodec (disconnecting it from the Surface) and ack [suspendDecoding]. */
+    private fun releaseForSuspend() {
+        decoder?.let { it.release(); decoder = null }
+        configuredSurface = null        // forces a rebuild against the live Surface on resume
+        suspendLatch?.let { it.countDown(); suspendLatch = null }
     }
 
     private fun configureDecoder(sps: ByteArray, pps: ByteArray) {
@@ -273,6 +316,7 @@ class MirrorStreamServer(
         private const val QUEUE_CAPACITY = 90                  // ~1.5s @60fps before dropping
         private const val SURFACE_WAIT_TRIES = 50
         private const val SURFACE_WAIT_MS = 100L
+        private const val SUSPEND_TIMEOUT_MS = 2000L
     }
 }
 

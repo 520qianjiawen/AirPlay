@@ -58,6 +58,8 @@ class CastReceiverService : Service() {
     private lateinit var upnpHttpServer: UpnpHttpServer
     private lateinit var wfdServer: WfdServer
     private lateinit var wifiDirectManager: WifiDirectManager
+    /** startAllServices() 已执行；防止重复 onStartCommand 再建一套接收器。 */
+    private var servicesStarted = false
     private lateinit var deviceUuid: String
     private var airPlayPlayerStarted = false
 
@@ -377,6 +379,16 @@ class CastReceiverService : Service() {
         networkWaitRunnable?.let { mainHandler.removeCallbacks(it) }
         networkWaitRunnable = null
 
+        // 服务已在运行时再次 onStartCommand（例如首次授予 Wi-Fi Direct 权限后界面重启服务）：
+        // 只重试 Wi-Fi Direct。重新 initReceivers + startAllServices 会再建一套 AirPlay/DLNA
+        // 接收器，新的绑不上 7000 端口，旧的却还在接连接 —— 视频投送的事件通道就落到了
+        // 失效的那一套上，iPhone 收不到播放状态。
+        if (servicesStarted) {
+            Timber.i("Cast services already running — only retrying Wi-Fi Direct")
+            runCatching { wifiDirectManager.start() }
+            return
+        }
+
         if (NetworkUtils.getLocalIpAddress() != null) {
             networkWaitElapsedMs = 0L
             initReceivers()
@@ -402,6 +414,7 @@ class CastReceiverService : Service() {
     }
 
     private fun startAllServices() {
+        servicesStarted = true
         // 启动 AirPlay 2 接收器
         airPlayReceiver.start()
 

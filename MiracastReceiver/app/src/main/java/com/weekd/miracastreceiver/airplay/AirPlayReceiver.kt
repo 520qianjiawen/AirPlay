@@ -237,11 +237,12 @@ class AirPlayReceiver(
                 npArtwork = bytes.takeIf { it.isNotEmpty() }
                 emitNowPlaying()
             },
-            onVideoPlay = { url, start -> startUrlVideo(url, start) },
+            onVideoPlay = { url, start, startSec -> startUrlVideo(url, start, startSec) },
             onVideoRate = { rate -> urlVideoPlayer?.setRate(rate) },
             onVideoScrub = { pos -> urlVideoPlayer?.scrub(pos) },
             onVideoStop = { stopUrlVideo() },
             onPlaybackInfo = { urlVideoPlayer?.info() },
+            isUrlVideoActive = { urlVideoPlayer != null },
             onRemoteControlInfo = { dacpId, activeRemote -> dacpClient.configure(dacpId, activeRemote) },
             pinAuthEnabled = pinAuthEnabled,
             pairingStore = pairingStore,
@@ -292,6 +293,13 @@ class AirPlayReceiver(
      * in sender pickers immediately.
      */
     private fun onStreamingStopped() {
+        if (urlVideoPlayer != null) {
+            // 镜像中全屏视频切换为视频投送后，iPhone 会 TEARDOWN 镜像流（甚至断开控制连接），
+            // 但视频由电视独立播放，不能跟着停。只释放镜像相关资源，视频结束时再完整收尾。
+            Logger.i("Mirror session ended while URL video is playing — keeping the video")
+            releaseMediaComponents(keepUrlVideo = true)
+            return
+        }
         Logger.i("Streaming stopped — releasing media components")
         releaseMediaComponents()
         emitState(AirPlayState.ADVERTISING)
@@ -493,23 +501,62 @@ class AirPlayReceiver(
      * AirPlay video URL mode (non-mirroring): show the streaming surface and hand the URL to
      * [AirPlayVideoPlayer], which fetches + plays it via MediaPlayer onto the same Surface.
      */
-    private fun startUrlVideo(url: String, startFraction: Double) {
-        onSenderNameChanged("AirPlay")
+    private fun startUrlVideo(url: String, startFraction: Double, startSeconds: Double? = null) {
+        val mirror = mirrorServer
+        if (mirror != null) {
+            // iOS hands a full-screen video off from a running mirror (e.g. Chrome/Safari native
+            // full screen). The mirror's MediaCodec still owns the Surface, and a Surface accepts one
+            // producer only — release it first or MediaPlayer can't attach and the TV stays black.
+            mirror.suspendDecoding()
+        } else {
+            onSenderNameChanged("AirPlay")
+        }
         emitState(AirPlayState.CONNECTED)   // shows StreamingScreen → Surface becomes available
         val player = urlVideoPlayer ?: AirPlayVideoPlayer(
             surfaceProvider = videoSurfaceProvider,
-            onEnded = { stopUrlVideo() }
+            onEnded = {
+                // iPhone 在 /play 后设置 actionAtItemEnd=1（播完暂停在末尾），由它决定下一步。
+                // 像 Apple TV 一样停在最后一帧、上报 paused，/playback-info 继续返回 位置=时长、
+                // 速率=0；iPhone 自己发 /stop 再切下一段（广告 → 正片）。主动上报 stopped 会被当成
+                // "电视端停止了播放"：iPhone 删掉该条目后卡在"隔空播放"画面，不再投送正片。
+                Logger.i("AirPlay URL video reached the end — paused at end, waiting for the sender")
+                rtspHandler?.sendVideoEvent("paused")
+            },
+            onFailed = { reason ->
+                // Tell the sender playback stopped so it leaves its "playing on TV" black screen
+                // (and, during a mirror, goes back to mirroring) instead of waiting forever.
+                Logger.w("AirPlay URL video failed: $reason")
+                rtspHandler?.sendVideoEvent("stopped")
+                stopUrlVideo()
+            },
+            onPlaying = { rtspHandler?.sendVideoEvent("playing") },
         ).also { urlVideoPlayer = it }
-        player.play(url, startFraction)
-        Logger.i("AirPlay URL video started: $url (start=$startFraction)")
+        rtspHandler?.sendVideoEvent("loading")
+        player.play(url, startFraction, startSeconds)
+        Logger.i("AirPlay URL video started: $url (start=$startFraction, fromMirror=${mirror != null})")
     }
 
-    /** Stops AirPlay video URL playback (POST /stop or end-of-media) and ends the session. */
+    /**
+     * Stops AirPlay video URL playback (POST /stop, end-of-media, or failure). If the video was
+     * handed off from a still-running screen mirror, go back to mirroring instead of ending the
+     * whole session (previously this tore the mirror down → black TV after leaving full screen).
+     */
     private fun stopUrlVideo() {
-        urlVideoPlayer?.release()
+        val player = urlVideoPlayer ?: return      // already stopped (failure + a later /stop)
+        player.release()
         urlVideoPlayer = null
-        onStreamingStopped()
-        Logger.i("AirPlay URL video stopped")
+        val mirror = mirrorServer
+        if (mirror == null && rtspHandler?.hasActiveSession == true) {
+            // 镜像流已被 iPhone 拆掉但会话还在：它收到 stopped 事件后会重新 SETUP 镜像流
+            // （广告播完 → 回到镜像 → 页面切到正片后再投一次）。保持播放页，不做完整收尾。
+            Logger.i("AirPlay URL video stopped — mirror session still open, waiting for the sender to resume mirroring")
+        } else if (mirror != null) {
+            mirror.resumeDecoding()
+            Logger.i("AirPlay URL video stopped — back to screen mirroring")
+        } else {
+            onStreamingStopped()
+            Logger.i("AirPlay URL video stopped")
+        }
     }
 
     /** Starts the AirPlay 2 buffered audio-only stream (type 103, Apple Music → TV); returns its TCP port. */
@@ -533,7 +580,7 @@ class AirPlayReceiver(
     }
 
     /** Clears the video NAL callback, closes the audio socket, and releases media components. */
-    private fun releaseMediaComponents() {
+    private fun releaseMediaComponents(keepUrlVideo: Boolean = false) {
         rtspHandler?.onVideoNalUnit = null
         try { audioSocket?.close() } catch (e: Exception) { /* non-fatal */ }
         audioSocket = null
@@ -543,8 +590,10 @@ class AirPlayReceiver(
         audioServer = null
         bufferedAudioServer?.stop()
         bufferedAudioServer = null
-        urlVideoPlayer?.release()
-        urlVideoPlayer = null
+        if (!keepUrlVideo) {
+            urlVideoPlayer?.release()
+            urlVideoPlayer = null
+        }
         ntpClient?.stop()
         ntpClient = null
         try { eventClientSocket?.close() } catch (e: Exception) { /* non-fatal */ }

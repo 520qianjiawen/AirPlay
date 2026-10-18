@@ -13,6 +13,7 @@ import kotlinx.coroutines.launch
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.Executors
 
 /**
  * RtspHandler — Manages the RTSP session with the AirPlay sender (macOS).
@@ -58,7 +59,8 @@ open class RtspHandler(
     /** Album artwork (JPEG/PNG bytes) from SET_PARAMETER; empty bytes = artwork cleared. */
     private val onArtwork: (ByteArray) -> Unit = {},
     /** AirPlay video URL mode: POST /play with a media URL + start fraction (0..1). */
-    private val onVideoPlay: (url: String, startFraction: Double) -> Unit = { _, _ -> },
+    /** startSeconds 优先于 startFraction（iOS 新版只发 Start-Position-Seconds）。 */
+    private val onVideoPlay: (url: String, startFraction: Double, startSeconds: Double?) -> Unit = { _, _, _ -> },
     /** AirPlay video transport: POST /rate (≤0 pause, >0 resume). */
     private val onVideoRate: (rate: Float) -> Unit = {},
     /** AirPlay video transport: POST /scrub — seek to position (seconds). */
@@ -67,6 +69,8 @@ open class RtspHandler(
     private val onVideoStop: () -> Unit = {},
     /** Current URL-video playback snapshot for GET /playback-info and GET /scrub. */
     private val onPlaybackInfo: () -> com.weekd.miracastreceiver.airplay.PlaybackInfo? = { null },
+    /** 当前是否有 AirPlay 视频投送（URL 模式）在播放；用于 TEARDOWN 时保留镜像会话。 */
+    private val isUrlVideoActive: () -> Boolean = { false },
     /** Sender's DACP reverse-control identity from RTSP headers (DACP-ID + Active-Remote token). */
     private val onRemoteControlInfo: (dacpId: String?, activeRemote: String?) -> Unit = { _, _ -> },
     /** When true, require HomeKit-style SRP PIN pairing before streaming (gated by AppSettings). */
@@ -91,6 +95,9 @@ open class RtspHandler(
 
     @Volatile
     private var activeClient: Socket? = null
+
+    /** 主控制连接（镜像会话）是否仍然在线。 */
+    val hasActiveSession: Boolean get() = activeClient != null
 
     @Volatile
     private var running = false
@@ -121,6 +128,15 @@ open class RtspHandler(
     protected val activeStreamTypes = mutableSetOf<Int>()
 
     private var setupCount = 0
+
+    // ─── AirPlay video "reverse" (PTTH) event channel ─────────────────────────
+    // A video sender opens a separate connection with POST /reverse and upgrades it to PTTH/1.0:
+    // from then on WE send it HTTP requests (POST /event with playing/paused/stopped). That's how a
+    // sender learns playback stopped or failed — without it iOS sits on its "playing on TV" screen.
+    private val reverseLock = Any()
+    @Volatile private var reverseSocket: Socket? = null
+    @Volatile private var reverseSessionId: String? = null
+    private val eventExecutor = Executors.newSingleThreadExecutor()
 
     private val requestReader = RtspRequestReader(
         maxMessageBytes = MAX_MESSAGE_BYTES,
@@ -154,6 +170,8 @@ open class RtspHandler(
         }
         activeClient = null
         serverSocket = null
+        synchronized(reverseLock) { runCatching { reverseSocket?.close() }; reverseSocket = null }
+        eventExecutor.shutdown()
         Logger.i("RTSP handler stopped")
     }
 
@@ -191,15 +209,18 @@ open class RtspHandler(
                 val clientSocket = serverSocket!!.accept()
                 Logger.i("New client connected: ${clientSocket.inetAddress.hostAddress}")
 
-                if (activeClient != null && !activeClient!!.isClosed) {
-                    Logger.w("Rejecting second client — already streaming")
-                    sendServiceUnavailable(clientSocket)
-                    clientSocket.close()
+                if (activeClient != null) {
+                    // A session is already live on another connection. iOS opens EXTRA connections
+                    // to hand a full-screen video off from a mirror (POST /reverse + POST /play) —
+                    // previously these sat unanswered (the accept loop was blocked in handleClient),
+                    // so the phone switched to "playing on TV" and the TV stayed black. Serve the
+                    // video endpoints there; session setup from a second sender still gets 503.
+                    scope.launch(Dispatchers.IO) { handleSideClient(clientSocket) }
                     continue
                 }
 
                 activeClient = clientSocket
-                handleClient(clientSocket)
+                scope.launch(Dispatchers.IO) { handleClient(clientSocket) }
             }
         } catch (e: Exception) {
             if (running) {
@@ -222,10 +243,13 @@ open class RtspHandler(
         // PIN/verifier and the "paired" flag must survive a reconnect. They live for the receiver's
         // lifetime — replaced by the next /pair-pin-start, set on a successful pairing.
         currentRemoteAddress = socket.inetAddress
+        // Set when this connection turns out to be a PTTH event channel (POST /reverse), not a session.
+        var reverseRequest: RtspRequest? = null
 
         try {
             while (running && !socket.isClosed) {
                 val request = requestReader.read(inputStream) ?: break
+                if (request.isReverseRequest()) { reverseRequest = request; break }
                 currentCSeq = request.headers["CSeq"]?.toIntOrNull() ?: 0
                 val response = routeRequest(request)
                 sendResponse(outputStream, response)
@@ -243,7 +267,7 @@ open class RtspHandler(
             }
 
             val session = currentSession
-            if (session != null && session.hasVideo && running) {
+            if (reverseRequest == null && session != null && session.hasVideo && running) {
                 RtpInterleaved.readLoop(
                     inputStream = inputStream,
                     onVideoNalUnit = { nalUnit, ptsUs ->
@@ -257,17 +281,178 @@ open class RtspHandler(
         } catch (e: Exception) {
             if (running) Logger.e("Error handling RTSP client", e)
         } finally {
-            Logger.i("Client disconnected")
-            socket.close()
-            activeClient = null
-            currentSession = null
-            pairingSession = null
-            fairPlay = null
-            isMirrorSession = false
-            activeStreamTypes.clear()
-            setupCount = 0
-            onStreamingStopped()
+            if (reverseRequest != null) {
+                // Not a session — just free the primary slot; nothing to tear down.
+                activeClient = null
+            } else {
+                try {
+                    Logger.i("Client disconnected")
+                    socket.close()
+                    currentSession = null
+                    pairingSession = null
+                    fairPlay = null
+                    isMirrorSession = false
+                    activeStreamTypes.clear()
+                    setupCount = 0
+                    onStreamingStopped()
+                } finally {
+                    // Cleared LAST: the accept loop hands the next connection the primary slot only
+                    // once this one's shared state has been reset (connections now run concurrently).
+                    activeClient = null
+                }
+            }
         }
+        reverseRequest?.let { serveReverseChannel(socket, it) }
+    }
+
+    /**
+     * Serves a connection opened while another session is live — the extra connections iOS uses
+     * for AirPlay video (URL mode) while mirroring. iOS pair-verifies each such connection first
+     * (rejecting that made it tear the mirror down on full screen), so pairing + FairPlay run on
+     * connection-local state here. Session RTSP verbs (SETUP/RECORD…) still belong to the primary
+     * connection, so a second sender trying to start a session gets 503 as before.
+     */
+    private fun handleSideClient(socket: Socket) {
+        val remote = socket.inetAddress?.hostAddress
+        val sidePairing = PairingSession(PairingKeys.get(context))
+        val sideFairPlay = FairPlay()
+        try {
+            val input = socket.getInputStream()
+            val output = socket.getOutputStream()
+            while (running && !socket.isClosed) {
+                val request = requestReader.read(input) ?: break
+                val path = request.uri.substringBefore("?")
+                Logger.i("AirPlay side connection ($remote): ${request.method} $path (${request.bodyBytes.size}B)")
+                if (request.isReverseRequest()) { serveReverseChannel(socket, request); return }
+                val cseq = request.headers["CSeq"]?.toIntOrNull() ?: 0
+                if (request.method !in SIDE_METHODS || (path.startsWith("/pair-") && path !in SIDE_PAIR_PATHS)) {
+                    Logger.w("AirPlay side connection: ${request.method} $path needs its own session — 503 (already streaming)")
+                    sendResponse(output, RtspResponse(503, "Service Unavailable", protocol = request.responseProtocol()), cseq)
+                    break
+                }
+                val response = when ("${request.method} $path") {
+                    "POST /pair-verify" -> handlePairVerify(request, sidePairing)
+                    "POST /pair-setup"  -> handlePairSetup(request, sidePairing)
+                    "POST /fp-setup"    -> handleFpSetup(request, sideFairPlay)
+                    "POST /fp-setup2"   -> handleFpSetup2(request)
+                    else                -> routeSideRequest(request, path)
+                }
+                sendResponse(output, response, cseq)
+            }
+        } catch (e: Exception) {
+            if (running) Logger.w("Side connection ($remote) error: ${e.message}")
+        } finally {
+            runCatching { socket.close() }
+            Logger.i("Side connection closed ($remote)")
+        }
+    }
+
+    private fun routeSideRequest(request: RtspRequest, path: String): RtspResponse = when ("${request.method} $path") {
+        "GET /info"           -> handleInfo(request)
+        "GET /server-info"    -> handleServerInfo(request)
+        "GET /playback-info"  -> handlePlaybackInfo(request)
+        "GET /scrub"          -> handleScrubGet(request)
+        "POST /play"          -> handleVideoPlay(request)
+        "POST /rate"          -> handleVideoRate(request)
+        "POST /scrub"         -> handleVideoScrubPost(request)
+        "POST /stop"          -> handleVideoStop(request)
+        // Playlist / property side-channel of AirPlay video — acknowledge so the sender proceeds.
+        "PUT /setProperty", "POST /setProperty" -> {
+            // 与 UxPlay 一致：已知的 HLS 属性（selectedMediaArray、isInterestedInDateRange 等）
+            // 回 {errorCode: 0}，发送端据此继续。
+            Logger.d("PUT /setProperty?${request.uri.substringAfter('?')} body: ${describePlist(request.bodyBytes)}")
+            RtspResponse(
+                200, "OK",
+                bodyBytes = PlistCodec.encodeXml(mapOf("errorCode" to 0)),
+                contentType = "text/x-apple-plist+xml",
+                protocol = request.responseProtocol()
+            )
+        }
+        "POST /action" -> {
+            Logger.d("POST /action body: ${describePlist(request.bodyBytes)}")
+            RtspResponse(200, "OK", protocol = request.responseProtocol())
+        }
+        else -> handleUnknownInternal(request)
+    }
+
+    /**
+     * POST /reverse: upgrade [socket] to the PTTH/1.0 event channel and hold it until the sender
+     * closes it. The sender is now the HTTP server; its replies to our POST /event are drained.
+     */
+    private fun serveReverseChannel(socket: Socket, request: RtspRequest) {
+        val sessionId = request.header("X-Apple-Session-ID")
+        Logger.i("POST /reverse — PTTH event channel up (session=$sessionId purpose=${request.header("X-Apple-Purpose")})")
+        try {
+            sendResponse(socket.getOutputStream(), RtspResponse(
+                101, "Switching Protocols",
+                headers = mapOf("Upgrade" to "PTTH/1.0", "Connection" to "Upgrade"),
+                protocol = "HTTP/1.1"
+            ))
+            synchronized(reverseLock) {
+                reverseSocket?.let { old -> if (old !== socket) runCatching { old.close() } }
+                reverseSocket = socket
+                reverseSessionId = sessionId
+            }
+            val input = socket.getInputStream()
+            val buf = ByteArray(4096)
+            while (running && input.read(buf) != -1) { /* sender's replies to our events */ }
+        } catch (e: Exception) {
+            if (running) Logger.d("PTTH event channel ended: ${e.message}")
+        } finally {
+            synchronized(reverseLock) {
+                if (reverseSocket === socket) { reverseSocket = null; reverseSessionId = null }
+            }
+            runCatching { socket.close() }
+            Logger.i("PTTH event channel closed")
+        }
+    }
+
+    /**
+     * Pushes an AirPlay video state event (`loading` / `playing` / `paused` / `stopped`) to the
+     * sender over the /reverse channel. Safe from any thread (MediaPlayer calls back on the main
+     * thread, where socket writes are forbidden) — writes happen on a single ordered worker.
+     */
+    fun sendVideoEvent(state: String) {
+        runCatching {
+            eventExecutor.execute {
+                synchronized(reverseLock) {
+                    val socket = reverseSocket
+                    if (socket == null) {
+                        Logger.d("video event '$state' not sent — no /reverse channel")
+                        return@synchronized
+                    }
+                    runCatching {
+                        val body = PlistCodec.encodeXml(mapOf("category" to "video", "sessionID" to 1, "state" to state))
+                        val head = StringBuilder()
+                            .append("POST /event HTTP/1.1\r\n")
+                            .append("Content-Type: text/x-apple-plist+xml\r\n")
+                            .append("Content-Length: ${body.size}\r\n")
+                            .apply { reverseSessionId?.let { append("X-Apple-Session-ID: $it\r\n") } }
+                            .append("\r\n")
+                        val out = socket.getOutputStream()
+                        out.write(head.toString().toByteArray(Charsets.US_ASCII))
+                        out.write(body)
+                        out.flush()
+                        Logger.i("→ AirPlay video event state=$state")
+                    }.onFailure { Logger.w("video event '$state' failed: ${it.message}") }
+                }
+            }
+        }.onFailure { Logger.d("video event '$state' dropped (handler stopped)") }
+    }
+
+    /** One-line summary of a plist body for logs (keys + short values; big blobs as sizes). */
+    private fun describePlist(bytes: ByteArray): String {
+        if (bytes.isEmpty()) return "(empty)"
+        return runCatching {
+            PlistCodec.decode(bytes).entries.joinToString { (k, v) ->
+                "$k=" + when (v) {
+                    is ByteArray -> "${v.size}B"
+                    is List<*> -> "list[${v.size}]"
+                    is Map<*, *> -> "dict{${v.keys.joinToString(",")}}"
+                    else -> v.toString().take(200)
+                }
+            }
+        }.getOrElse { "(${bytes.size}B, not a plist: ${String(bytes, Charsets.UTF_8).take(200).replace("\r\n", " | ")})" }
     }
 
     private fun routeRequest(request: RtspRequest): RtspResponse {
@@ -336,7 +521,21 @@ open class RtspHandler(
             return RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
         }
         Logger.i("POST /play url=$url start=$start")
-        onVideoPlay(url, start)
+        Logger.i("POST /play body: ${describePlist(request.bodyBytes)}")
+        val scheme = url.substringBefore(':', "").lowercase()
+        if (scheme != "http" && scheme != "https") {
+            // e.g. mlhls://localhost/… (HLS relayed through the sender via /reverse + FCUP, used by
+            // YouTube and some web players) — not implemented. Accepting it would leave both the
+            // TV and the phone black, so refuse and tell the sender playback has stopped.
+            Logger.w("POST /play: unsupported URL scheme '$scheme' — rejecting")
+            sendVideoEvent("stopped")
+            return RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
+        }
+        // iOS 镜像中全屏切换时只带 Start-Position-Seconds（手机当前已播到的秒数），没有比例值
+        val startSeconds = if (request.isPlistBody()) {
+            runCatching { PlistCodec.decode(request.bodyBytes)["Start-Position-Seconds"] as? Double }.getOrNull()
+        } else null
+        onVideoPlay(url, start, startSeconds)
         return RtspResponse(200, "OK", protocol = request.responseProtocol())
     }
 
@@ -422,7 +621,11 @@ open class RtspHandler(
     private fun handleServerInfo(request: RtspRequest): RtspResponse {
         val info = mapOf(
             "deviceid" to com.weekd.miracastreceiver.util.NetworkUtils.getMacAddress(),
-            "features" to 0x1E5A7FFFF7L,
+            // 视频投送连接读这里的 features 决定是否先做 FairPlay：声明了 FairPlay 认证位时，iPhone
+            // 会走 fp-setup → fp-setup2（未实现）然后放弃投送。参照乐播只声明 AirPlay 1 的视频类能力
+            // （0x2A7F：Video/Photo/VideoFairPlay/VolumeControl/HLS/Slideshow/bit6/Audio/bit11/bit13），
+            // iPhone 就直接 /reverse + /play。镜像能力仍由 /info 与 mDNS 声明。
+            "features" to 0x2A7FL,
             "model" to "AppleTV5,3",
             "protovers" to "1.1",
             "srcvers" to "220.68",
@@ -486,10 +689,10 @@ open class RtspHandler(
      * auth on, it runs the HomeKit-style SRP pair-setup (TLV8) — showing a PIN on the TV that the
      * user types on the Mac — so only someone with screen access can pair.
      */
-    private fun handlePairSetup(request: RtspRequest): RtspResponse {
+    private fun handlePairSetup(request: RtspRequest, session: PairingSession = pairingSession!!): RtspResponse {
         // /pair-setup is the anonymous key exchange; PIN access control runs on /pair-setup-pin.
         return try {
-            val body = pairingSession!!.pairSetup(request.bodyBytes)
+            val body = session.pairSetup(request.bodyBytes)
             Logger.i("pair-setup OK (returned ${body.size}-byte public key)")
             RtspResponse(200, "OK", bodyBytes = body, contentType = OCTET_STREAM, protocol = request.responseProtocol())
         } catch (e: Exception) {
@@ -503,7 +706,7 @@ open class RtspHandler(
      * PIN access control on (the PIN is a SEPARATE /pair-pin-start + /pair-setup-pin layer), so this
      * is never the HomeKit TLV8 variant.
      */
-    private fun handlePairVerify(request: RtspRequest): RtspResponse {
+    private fun handlePairVerify(request: RtspRequest, session: PairingSession = pairingSession!!): RtspResponse {
         // PIN access control: refuse pair-verify until the controller has PIN-paired this connection.
         // macOS responds to the rejection by starting the PIN flow (/pair-pin-start → /pair-setup-pin).
         if (pinAuthEnabled && !pinPaired) {
@@ -511,7 +714,7 @@ open class RtspHandler(
             return RtspResponse(470, "Connection Authorization Required", protocol = request.responseProtocol())
         }
         return try {
-            val body = pairingSession!!.pairVerify(request.bodyBytes)
+            val body = session.pairVerify(request.bodyBytes)
             Logger.i("pair-verify ${if (request.bodyBytes.firstOrNull()?.toInt() == 1) "M1" else "M2"} OK (returned ${body.size} bytes)")
             RtspResponse(200, "OK", bodyBytes = body, contentType = OCTET_STREAM, protocol = request.responseProtocol())
         } catch (e: Exception) {
@@ -584,9 +787,20 @@ open class RtspHandler(
         }
     }
 
+    /**
+     * POST /fp-setup2 — 发送端为视频投送请求的另一种 FairPlay 变体（受保护内容的解密）。
+     * 未实现；与 UxPlay 一样回 421 Misdirected Request，让发送端放弃这条路径。
+     */
+    private fun handleFpSetup2(request: RtspRequest): RtspResponse {
+        val b = request.bodyBytes
+        Logger.w("POST /fp-setup2 unsupported (${b.size}B, version=0x%02x) — 421; head=%s".format(
+            if (b.size > 4) b[4].toInt() and 0xFF else -1,
+            b.take(24).joinToString(" ") { "%02x".format(it) }))
+        return RtspResponse(421, "Misdirected Request", protocol = request.responseProtocol())
+    }
+
     /** POST /fp-setup — FairPlay: 16-byte phase 1 → 142-byte reply; 164-byte phase 2 → 32-byte reply. */
-    private fun handleFpSetup(request: RtspRequest): RtspResponse = try {
-        val fp = fairPlay!!
+    private fun handleFpSetup(request: RtspRequest, fp: FairPlay = fairPlay!!): RtspResponse = try {
         val b = request.bodyBytes
         // Diagnostics: byte 4 is the FairPlay version (0x03 mirroring/Safari, 0x02 Apple Music audio);
         // for phase 1, byte 14 is the mode (0..3). Confirms which path a given sender uses.
@@ -821,6 +1035,13 @@ open class RtspHandler(
                 Logger.i("TEARDOWN streams=$streamTypes — stopped those, session continues (active=$activeStreamTypes)")
                 return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
             }
+            if (isUrlVideoActive()) {
+                // 镜像中全屏切到视频投送：iPhone 拆掉镜像流，但控制连接和会话（密钥、事件通道、NTP）
+                // 要保留——视频结束后它会在同一会话上重新 SETUP 镜像流（见乐播日志）。这里拆掉会话
+                // 会让 iPhone 直接断开主连接，广告播完后正片就再也投不过来。
+                Logger.i("TEARDOWN streams=$streamTypes — last mirror stream removed during URL video; keeping the session")
+                return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
+            }
             Logger.i("TEARDOWN streams=$streamTypes — last stream removed, ending session")
         } else {
             Logger.i("TEARDOWN (session, body=${request.bodyBytes.size}B) — streaming stopping")
@@ -947,7 +1168,7 @@ open class RtspHandler(
         )
     }
 
-    private fun sendResponse(outputStream: OutputStream, response: RtspResponse) {
+    private fun sendResponse(outputStream: OutputStream, response: RtspResponse, cseq: Int = currentCSeq) {
         // Binary-safe: build the header block as ASCII, then write the raw body bytes.
         // Content-Length must be the BYTE length (not String.length) so binary plists,
         // FairPlay payloads, and encrypted bodies are framed correctly.
@@ -955,7 +1176,7 @@ open class RtspHandler(
         val head = StringBuilder()
         head.append("${response.protocol} ${response.statusCode} ${response.statusMessage}\r\n")
         if (response.protocol.startsWith("RTSP")) {
-            head.append("CSeq: $currentCSeq\r\n")
+            head.append("CSeq: $cseq\r\n")
         }
         head.append("Server: AirTunes/220.68\r\n")
         response.contentType?.let { head.append("Content-Type: $it\r\n") }
@@ -985,6 +1206,10 @@ open class RtspHandler(
 
     companion object {
         private const val RTSP_PORT = 7000
+        /** Methods a side connection may use (AirPlay video endpoints); RTSP session verbs need the primary. */
+        private val SIDE_METHODS = setOf("GET", "POST", "PUT")
+        /** Pairing endpoints a side connection may run on its own (per-connection) state. */
+        private val SIDE_PAIR_PATHS = setOf("/pair-verify", "/pair-setup")
 
         // SRP PIN access control. macOS's AirPlay code-entry field is exactly 4 digits, so the PIN
         // must be 4 digits to be enterable. A 4-digit space is low-entropy, so the load-bearing
@@ -1006,6 +1231,13 @@ open class RtspHandler(
 
 private fun RtspRequest.isPhotoRequest(): Boolean =
     uri.substringBefore("?") == PhotoHandler.PHOTO_PATH
+
+private fun RtspRequest.isReverseRequest(): Boolean =
+    method == "POST" && uri.substringBefore("?") == "/reverse"
+
+/** Case-insensitive header lookup (senders differ in header casing). */
+private fun RtspRequest.header(name: String): String? =
+    headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
 
 private fun RtspRequest.responseProtocol(): String =
     if (protocol.startsWith("HTTP/")) protocol else "RTSP/1.0"
