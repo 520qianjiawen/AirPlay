@@ -153,7 +153,7 @@ cd MiracastReceiver
 
 ### 🙏 致谢与参考
 
-- AirPlay 屏幕镜像实现借鉴并参考了 [PhairPlay](https://github.com/philippe44/PhairPlay) 项目的协议流程与实现思路。
+- AirPlay 屏幕镜像实现借鉴并参考了 [PhairPlay](https://github.com/mazer666/PhairPlay) 项目的协议流程与实现思路。
 
 ### 🐛 已知问题
 
@@ -331,7 +331,7 @@ Output APKs: `app/build/outputs/apk/`
 
 ### 🙏 Acknowledgements & References
 
-- AirPlay screen mirroring is inspired by and references the protocol flow and implementation ideas from [PhairPlay](https://github.com/philippe44/PhairPlay).
+- AirPlay screen mirroring is inspired by and references the protocol flow and implementation ideas from [PhairPlay](https://github.com/mazer666/PhairPlay).
 
 ### 🐛 Known Issues
 
