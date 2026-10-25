@@ -1,8 +1,8 @@
-# Miracast Receiver for Android TV
+# AirPlay (Android TV 投屏接收端)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Android](https://img.shields.io/badge/Android-5.0%2B-green.svg)](https://developer.android.com)
-[![GitHub release](https://img.shields.io/github/v/release/weekdayjast/MiracastReceiver)](https://github.com/weekdayjast/MiracastReceiver/releases)
+[![GitHub release](https://img.shields.io/github/v/release/520qianjiawen/AirPlay)](https://github.com/520qianjiawen/AirPlay/releases)
 
 > 由于电视投屏广告日益猖獗，乐播投屏只允许本人快乐几分钟，本人深感震惊、愤怒、无奈，并在反复挣扎、彻夜难眠、认真思考三秒钟后，做出了一个违背祖宗的决定：
 >
@@ -76,7 +76,7 @@
 
 #### 下载安装
 
-1. 前往 [Releases](https://github.com/weekdayjast/MiracastReceiver/releases) 下载最新版本 APK
+1. 前往 [Releases](https://github.com/520qianjiawen/AirPlay/releases) 下载最新版本 APK，或直接在 [apk/ 目录](apk/) 下载。
    - **ARM64 (推荐)**：适用于大多数现代 Android TV
    - **ARM32**：适用于老旧设备
 
@@ -118,8 +118,8 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/weekdayjast/MiracastReceiver.git
-cd MiracastReceiver
+git clone https://github.com/520qianjiawen/AirPlay.git
+cd AirPlay
 
 # 构建 Debug APK
 cd MiracastReceiver
@@ -296,8 +296,8 @@ cd MiracastReceiver
 
 ```bash
 # Clone repository
-git clone https://github.com/weekdayjast/MiracastReceiver.git
-cd MiracastReceiver
+git clone https://github.com/520qianjiawen/AirPlay.git
+cd AirPlay
 
 # Build debug APK
 cd MiracastReceiver
@@ -383,7 +383,7 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) file for
 
 ## 📞 Contact
 
-- GitHub Issues: [https://github.com/weekdayjast/MiracastReceiver/issues](https://github.com/weekdayjast/MiracastReceiver/issues)
+- GitHub Issues: [https://github.com/520qianjiawen/AirPlay/issues](https://github.com/520qianjiawen/AirPlay/issues)
 
 ## ⭐ Star History
 
