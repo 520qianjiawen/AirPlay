@@ -24,6 +24,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
@@ -172,6 +173,9 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 投屏播放页面全局常亮，防止电视触发系统屏保与休眠
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         setContentView(R.layout.activity_player)
 
         initViews()
@@ -198,6 +202,11 @@ class PlayerActivity : AppCompatActivity() {
         tvError = findViewById(R.id.tv_error)
         tvStreamInfo = findViewById(R.id.tv_stream_info)
         bufferingIndicator = findViewById(R.id.buffering_indicator)
+
+        // 视图层显式开启 keepScreenOn
+        playerView.keepScreenOn = true
+        mirrorSurfaceView.keepScreenOn = true
+        imageView.keepScreenOn = true
     }
 
     /**
@@ -235,6 +244,7 @@ class PlayerActivity : AppCompatActivity() {
         player = ExoPlayer.Builder(this)
             .setTrackSelector(trackSelector!!)
             .setLoadControl(loadControl)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
             .apply {
                 addListener(object : Player.Listener {
@@ -605,6 +615,7 @@ class PlayerActivity : AppCompatActivity() {
         isMiracastSession = false
         isAirPlayMirrorSession = false
         streamInfoTracker.reset()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         stopImageSlideShow()
         imageView.visibility = View.GONE
         playerView.visibility = View.VISIBLE
@@ -657,6 +668,7 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun showImage(uri: String) {
         Timber.i("Showing image: $uri")
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         player?.pause()
         playerView.visibility = View.GONE
         imageView.visibility = View.VISIBLE
@@ -936,11 +948,17 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (isCurrentImage()) startImageSlideShow() else {
             player?.play()
             startProgressUpdates()
         }
         if (isStreamInfoVisible) showStreamInfo()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     override fun onStop() {

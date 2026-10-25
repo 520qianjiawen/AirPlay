@@ -31,6 +31,9 @@
          持有「显示在其他应用上层」权限的应用可豁免，否则应用不在前台时投屏没有画面 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
+    <!-- 播放防休眠与保持唤醒锁 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- TV 特性声明 -->
     <uses-feature
         android:name="android.hardware.touchscreen"
