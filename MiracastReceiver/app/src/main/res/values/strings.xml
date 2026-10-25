@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Miracast Receiver</string>
+    <string name="app_name">AirPlay</string>
     <string name="device_name">智能电视</string>
     <string name="waiting_connection">等待投屏连接...</string>
     <string name="device_ip">设备 IP: %s</string>

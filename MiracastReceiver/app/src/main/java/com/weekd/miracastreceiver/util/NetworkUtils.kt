@@ -1,4 +1,4 @@
-﻿package com.weekd.miracastreceiver.util
+package com.weekd.miracastreceiver.util
 
 import android.content.Context
 import android.net.wifi.WifiManager
@@ -123,7 +123,7 @@ object NetworkUtils {
     }
 
     // Constants
-    private const val DEFAULT_DEVICE_NAME = "PhairPlay"
+    private const val DEFAULT_DEVICE_NAME = "AirPlay"
     private const val FALLBACK_MAC_ADDRESS = "aa:bb:cc:dd:ee:ff"
     private const val PREFS_NAME = "phairplay_prefs"
     private const val PREF_KEY_DEVICE_UUID = "phairplay_device_uuid"
